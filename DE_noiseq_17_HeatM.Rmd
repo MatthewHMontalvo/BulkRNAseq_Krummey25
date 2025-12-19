@@ -1,0 +1,1075 @@
+---
+title: "NOISeq bulk RNAseq CD8 Differential Expression Analysis"
+author: "MHM"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    dev: png
+  pdf_document:
+    dev: png
+  word_document:
+    dev: png
+---
+### TO DO: heatmap borders, width
+
+####################################
+### 1. Package Installation/Loading
+####################################
+```{r packages}
+# 1. Package Installation/Loading
+if (!require("tinytex")) install.packages("tinytex")
+if (!require("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+if (!require("edgeR")) BiocManager::install("edgeR")
+if (!require("NOISeq")) BiocManager::install("NOISeq")
+
+required_packages <- c("ggplot2", "pheatmap", "dplyr", "purrr", "EDASeq", "matrixStats", "reshape2", "viridis", "clusterProfiler", "org.Mm.eg.db", "AnnotationDbi", "readxl")
+new_packages <- required_packages[!(required_packages %in% installed.packages()[,"Package"])]
+if (length(new_packages)) install.packages(new_packages)
+
+library(NOISeq); library(edgeR); library(ggplot2); library(pheatmap)
+library(dplyr); library(purrr); library(EDASeq); library(matrixStats)
+library(reshape2); library(viridis); library(clusterProfiler)
+library(org.Mm.eg.db); library(AnnotationDbi); library(readxl)
+```
+
+####################################
+### 2. Data Loading and Preprocessing
+####################################
+```{r data_loading}
+# Data loading with proper readData syntax
+
+data_dir <- "/Users/holdenmontalvo/Desktop/pipeline_results/quants"
+raw_counts <- read.csv(file.path(data_dir, "counts_data.csv"), row.names = "Geneid")
+raw_counts <- raw_counts[, c("S1", "S2", "S3", "S4")]
+colnames(raw_counts) <- c("naiveCD8", "CD8_CD62L-CD43-", "CD8_CD62Lplus", "CD43plus")
+filtered_counts <- raw_counts[rowSums(raw_counts >= 10) >= 1, ]
+
+# Create proper sample metadata
+sample_metadata <- data.frame(
+  Condition = factor(
+    c("naiveCD8", "CD8_CD62L-CD43-", "CD8_CD62Lplus", "CD43plus"),
+    levels = c("naiveCD8", "CD8_CD62Lplus", "CD8_CD62L-CD43-", "CD43plus")
+  ),
+  row.names = colnames(filtered_counts)
+)
+# Recode for both renaming of DE and plotting
+sample_metadata$Condition <- recode_factor(
+  sample_metadata$Condition,
+  "naiveCD8"          = "naïve",
+  "CD8_CD62Lplus"     = "CD62L+",
+  "CD8_CD62L-CD43-"   = "CD62L-CD43-",
+  "CD43plus"          = "CD43+"
+)
+
+# Corrected NOISeq data object creation
+noiseq_data <- NOISeq::readData(
+  data = as.matrix(filtered_counts),  # Key fix: use 'data' parameter
+  factors = sample_metadata
+)
+```
+
+
+####################################
+### 2.5. QC Analysis
+####################################
+```{r quality_control}
+# Required packages
+library(EDASeq)
+library(matrixStats)
+library(reshape2)
+library(viridis)
+library(pheatmap)
+
+# 1. Remove invalid samples FIRST
+lib_sizes <- colSums(filtered_counts)
+if (any(lib_sizes == 0)) {
+  invalid_samples <- colnames(filtered_counts)[lib_sizes == 0]
+  warning("Removing samples with zero counts: ", paste(invalid_samples, collapse = ", "))
+  filtered_counts <- filtered_counts[, lib_sizes > 0]
+  sample_metadata <- sample_metadata[lib_sizes > 0, , drop = FALSE]
+}
+
+# 2. Proceed with normalization
+dge <- DGEList(filtered_counts)
+dge <- calcNormFactors(dge)
+log_cpm <- cpm(dge, log = TRUE, prior.count = 1)
+
+# 2.5 Clean NA/NaN values
+log_cpm[is.na(log_cpm) | is.infinite(log_cpm)] <- 0
+
+
+### 3. Sample Correlation Heatmap
+cor_matrix <- cor(log_cpm)
+pheatmap(cor_matrix,
+         annotation_col = sample_metadata,
+         main = "Sample Correlation Heatmap",
+         color = viridis(50))
+
+### 4. Mean-Variance Relationship (Fixed)
+mean_var <- data.frame(
+  Mean = rowMeans2(log_cpm, na.rm = TRUE),
+  Variance = rowVars(log_cpm, na.rm = TRUE)
+) %>% filter(Variance > 0 & !is.na(Variance))
+
+ggplot(mean_var, aes(x = Mean, y = Variance)) +
+  geom_hex(bins = 50) +
+  geom_smooth(color = "red") +
+  scale_fill_viridis() +
+  labs(title = "Mean-Variance Relationship") +
+  theme_bw()
+
+### 5. Genes Detected per Sample
+detected_genes <- data.frame(
+  Sample = colnames(filtered_counts),
+  Counts = colSums(filtered_counts >= 1)
+)
+
+ggplot(detected_genes, aes(x = Sample, y = Counts/1000, fill = Sample)) +
+  geom_bar(stat = "identity") +
+  labs(y = "Genes Detected (thousands)", title = "Expressed Genes per Sample") +
+  theme_minimal()
+
+### 6. Library Size Distribution
+lib_sizes <- data.frame(
+  Sample = colnames(filtered_counts),
+  Size = colSums(filtered_counts)/1e6
+)
+
+ggplot(lib_sizes, aes(x = Sample, y = Size, fill = Sample)) +
+  geom_bar(stat = "identity") +
+  labs(y = "Library Size (millions)", title = "Sequencing Depth per Sample") +
+  theme_minimal()
+
+### 7. MDS Plot
+mds_data <- plotMDS.DGEList(dge, plot = FALSE)
+mds_df <- data.frame(
+  MDS1 = mds_data$x,
+  MDS2 = mds_data$y,
+  Condition = sample_metadata$Condition
+)
+
+ggplot(mds_df, aes(MDS1, MDS2, color = Condition)) +
+  geom_point(size = 4) +
+  ggtitle("Multidimensional Scaling Plot") +
+  theme_bw()
+
+### 8. Gene Expression Density
+log_counts <- melt(log_cpm, varnames = c("Gene", "Sample"), value.name = "Log2CPM")
+
+ggplot(log_counts, aes(x = Log2CPM, color = Sample)) +
+  geom_density(linewidth = 0.8) +
+  labs(title = "Gene Expression Density Distribution") +
+  theme_minimal()
+
+### 9. RLE Plots (Fix NaNs warning??)
+par(mfrow = c(1,2))
+plotRLE(log_cpm,  # Use cleaned matrix directly
+        outline = FALSE, 
+        col = as.numeric(sample_metadata$Condition),
+        main = "RLE Plot (Raw)",
+        na.rm = TRUE,
+        range = 2)
+plotRLE(cpm(dge, log = TRUE),
+        outline = FALSE,
+        col = as.numeric(sample_metadata$Condition),
+        main = "RLE Plot (Normalized)",
+        na.rm = TRUE,
+        range = 2)
+par(mfrow = c(1,1))
+
+```
+
+####################################
+### 3. Differential Expression Analysis
+####################################
+```{r de_analysis}
+
+comparisons <- list(
+  c("CD43+",     "naïve"),
+  c("CD43+",     "CD62L-CD43-"),
+  c("CD43+",     "CD62L+")
+)
+
+run_noiseq <- function(cond_pair) {
+  noiseq_results <- noiseq(
+    input = noiseq_data,
+    factor = "Condition",
+    conditions = cond_pair,
+    norm = "tmm",
+    replicates = "no",
+    k = 0.5
+  )
+  
+  de_genes_all <- degenes(noiseq_results, q = 0.9, M = NULL) # M = Log2 Value
+  de_genes <- de_genes_all[abs(de_genes_all$M) >= log2(2.0), ] # Set Log2 Cutoff Value
+  
+  return(list(
+    results = noiseq_results,
+    de_genes = de_genes,
+    comparison = paste(cond_pair, collapse = "_vs_")
+  ))
+}
+
+all_results <- map(comparisons, run_noiseq)
+```
+########################################################################
+#Origin of the Probability Value (DE Prob)
+NOISeq's Core Concept
+NOISeq uses a non-parametric approach that compares observed differences between conditions to technical noise distributions (rather than relying on p-values).
+
+#Calculation Process
+For each gene, NOISeq:
+-Simulates technical replicates to model technical variability
+-Compares the observed log2 fold change (M) and absolute expression difference (D) to this noise distribution
+-Computes:
+prob=P(observed difference>technical noise)
+
+#Interpretation
+prob = 1: Observed difference exceeds technical noise with certainty
+prob = 0: Observed difference matches technical noise
+
+Your threshold: prob >= 0.9 (the value used in the code) = 90% confidence the difference is biological
+########################################################################
+
+####################################
+### 3.5. Top 80 DE Genes Table (with Gene Names, renamed col., sorted [prob, abs(M)], Type)
+####################################
+```{r top_de_table_with_receptor}
+# Load required packages
+if (!require("readxl")) install.packages("readxl")
+if (!require("org.Mm.eg.db")) BiocManager::install("org.Mm.eg.db")
+
+library(readxl)
+library(AnnotationDbi)
+library(org.Mm.eg.db)
+library(dplyr)
+library(purrr)
+
+# Define ENSEMBL to symbol mapping
+ensembl_to_symbol <- function(ids) {
+  mapIds(org.Mm.eg.db,
+         keys = ids,
+         column = "SYMBOL",
+         keytype = "ENSEMBL",
+         multiVals = "first")
+}
+
+# Read cell type data
+receptor_data <- read_excel("genes_type.xlsx") %>%
+  setNames(c("Gene", "Type")) %>%
+  mutate(Gene = toupper(Gene))
+
+# Modified table generation
+walk(all_results, function(res) {
+  tryCatch({
+    comp_name <- res$comparison
+    top_genes <- res$de_genes %>%
+      tibble::rownames_to_column("ENSEMBL") %>%
+      arrange(desc(prob), desc(abs(M))) %>%  
+      head(80) %>%
+      
+      mutate(
+        Gene = ensembl_to_symbol(ENSEMBL),
+        Gene = ifelse(is.na(Gene), ENSEMBL, Gene),
+        Gene_upper = toupper(Gene),  # Case-insensitive matching
+        across(c(M, D, prob), ~round(., 3))
+      ) %>%
+      
+      left_join(receptor_data, by = c("Gene_upper" = "Gene")) %>%
+      dplyr::select(-Gene_upper) %>%
+      dplyr::rename(
+        `Log2 FC (M)` = M,
+        `Δ Expression (D)` = D,
+        `DE Prob` = prob
+      ) %>%
+      
+      dplyr::select(Gene, `DE Prob`, `Log2 FC (M)`, Type, everything(), -ENSEMBL, -ranking)
+    
+     # Print to HTML
+    cat("\n\n### Comparison:", comp_name, "\n")
+    knitr::kable(top_genes, 
+                 caption = paste("Top 80 DE Genes:", comp_name)) %>%
+      print()
+    
+    # Save as CSV
+    csv_name <- paste0("Top80_DE_Genes_", sanitize_name(comp_name), ".csv")
+    write.csv(top_genes, csv_name, row.names = FALSE)
+    
+  }, error = function(e) {
+    message("Error generating table for ", res$comparison, ": ", e$message)
+  })
+})
+```
+
+####################################
+### 4. Data Visualization
+####################################
+```{r visualization}
+ma_plot <- function(de_data, comp_name) {
+  # Subset normalized counts to DE genes only
+  dge_object <- DGEList(counts = filtered_counts[rownames(de_data), ])
+  dge_object <- calcNormFactors(dge_object)
+  normalized_counts <- cpm(dge_object, log = TRUE, prior.count = 1)
+  
+  ma_df <- data.frame(
+    Mean = rowMeans(normalized_counts),
+    Log2FC = de_data$M,
+    Significant = de_data$prob >= 0.9 & abs(de_data$M) >= log2(3.0)
+  )
+  
+  ggplot(ma_df, aes(x = Mean, y = Log2FC, color = Significant)) +
+    geom_point(alpha = 0.7, size = 1.5) +
+    scale_color_manual(values = c("gray70", "firebrick")) +
+    labs(title = paste("MA Plot:", comp_name),
+         x = "Average Expression (Log2 CPM)",
+         y = "Log2 Fold Change") +
+    theme_classic()
+}
+# Volcano Plot
+volcano_plot <- function(de_data, comp_name) {
+  volcano_df <- data.frame(
+    Log2FC = de_data$M,
+    NegLogProb = -log10(1 - de_data$prob),  # Convert probability to -log10 scale
+    Significant = de_data$prob >= 0.9 & abs(de_data$M) >= log2(3.0)
+  )
+  
+  ggplot(volcano_df, aes(x = Log2FC, y = NegLogProb, color = Significant)) +
+    geom_point(alpha = 0.7, size = 1.5) +
+    scale_color_manual(values = c("gray70", "firebrick")) +
+    geom_hline(yintercept = -log10(0.1), linetype = "dashed", color = "blue") +
+    geom_vline(xintercept = c(-log2(3.0), log2(3.0)), linetype = "dashed", color = "blue") +
+    labs(title = paste("Volcano Plot:", comp_name),
+         x = "Log2 Fold Change (2.0 Cutoff)",
+         y = "-Log10(1 - Probability)") +
+    theme_classic()
+}
+
+# Heatmap Plot
+de_heatmap <- function(de_genes, comp_name) {
+  # Subset normalized counts to DE genes only
+  dge_object <- DGEList(counts = filtered_counts[rownames(de_genes), ])
+  dge_object <- calcNormFactors(dge_object)
+  normalized_counts <- cpm(dge_object, log = TRUE, prior.count = 1)
+  
+  top_genes <- de_genes[order(de_genes$prob, decreasing = TRUE), ] %>% head(50)
+  heatmap_data <- normalized_counts[rownames(top_genes), ]
+  
+  pheatmap(
+    heatmap_data,
+    annotation_col = sample_metadata,
+    show_rownames = FALSE,
+    color = colorRampPalette(c("navy", "white", "firebrick3"))(50),
+    main = paste("Top 50 DE Genes:", comp_name)
+  )
+}
+
+# Generate all plots for each comparison
+walk(all_results, ~{
+  
+  # Generate plots
+  print(ma_plot(.x$de_genes, .x$comparison))
+  print(volcano_plot(.x$de_genes, .x$comparison))
+  de_heatmap(.x$de_genes, .x$comparison)
+})
+
+# Log2 Fold Change Cutoff = 2.0
+# Log2 Fold Change "Significant" = 3.0
+```
+####################################
+### 4.5. Heatmap Export
+####################################
+```{r save_heatmaps}
+# Create directory if needed
+if (!dir.exists("plots")) dir.create("plots")
+
+# Sanitize comparison names for filenames
+sanitize_name <- function(name) {
+  tolower(gsub("[^[:alnum:]]", "_", name)) %>%
+    gsub("_+", "_", .) %>%
+    gsub("^_|_$", "", .)
+}
+
+# Function to save heatmaps
+save_heatmaps <- function(results) {
+  walk(results, ~{
+    comp_name <- .x$comparison
+    de_genes <- .x$de_genes
+    
+    if(nrow(de_genes) > 0) {
+      # Create filename
+      fname <- paste0("plots/Heatmap_", sanitize_name(comp_name), ".png")
+      
+      # Save plot
+      png(fname, width = 10, height = 8, units = "in", res = 300)
+      print(de_heatmap(de_genes, comp_name))
+      dev.off()
+      
+      message("Saved heatmap: ", fname)
+    } else {
+      message("No DE genes for heatmap: ", comp_name)
+    }
+  })
+}
+
+# Execute heatmap saving
+message("\n=== Saving Heatmaps ===")
+save_heatmaps(all_results)
+message("\n=== Heatmap Save Complete ===")
+```
+####################################
+### 4.6. Other Plots Export
+####################################
+```{r Export_Plots}
+# Create plot directory
+if (!dir.exists("plots")) dir.create("plots")
+
+# Enhanced filename sanitization
+sanitize_name <- function(name) {
+  name %>% 
+    tolower() %>%
+    gsub("[^a-z0-9]+", "_", .) %>%
+    gsub("^_|_$", "", .)
+}
+
+# Modified plotting functions with saving
+save_ma_plot <- function(de_data, comp_name) {
+  p <- ma_plot(de_data, comp_name)
+  fname <- paste0("plots/MA_", sanitize_name(comp_name), ".png")
+  ggsave(fname, p, width = 8, height = 6, dpi = 300)
+  p
+}
+
+save_volcano_plot <- function(de_data, comp_name) {
+  p <- volcano_plot(de_data, comp_name)
+  fname <- paste0("plots/Volcano_", sanitize_name(comp_name), ".png")
+  ggsave(fname, p, width = 8, height = 6, dpi = 300)
+  p
+}
+
+
+# Generate and save all plots
+walk(all_results, ~{
+  comp <- .x$comparison
+  message("Processing: ", comp)
+  
+  tryCatch({
+    # MA Plot
+    print(save_ma_plot(.x$de_genes, comp))
+    # Volcano Plot
+    print(save_volcano_plot(.x$de_genes, comp))
+  })
+})
+```
+
+```{r complex_heatmap2, message=FALSE, warning=FALSE}
+# 1) make sure you have the ID mapping function loaded:
+library(AnnotationDbi)
+library(org.Mm.eg.db)
+library(ComplexHeatmap)
+library(circlize)
+
+# 2) map your rownames of log_cpm (ENSEMBL) → SYMBOL
+symb <- mapIds(org.Mm.eg.db,
+               keys    = rownames(log_cpm),
+               column  = "SYMBOL",
+               keytype = "ENSEMBL",
+               multiVals = "first")
+
+# drop any that didn’t map
+expr_sym <- log_cpm[!is.na(symb), , drop=FALSE]
+rownames(expr_sym) <- toupper(symb[!is.na(symb)])
+
+# 3) condition mapping (raw → pretty)
+cond_map <- c(
+  naiveCD8            = "naïve",
+  CD8_CD62Lplus       = "CD62L+",
+  `CD8_CD62L-CD43-`   = "CD62L-CD43-",
+  CD43plus            = "CD43+"
+)
+col_conds <- cond_map[colnames(expr_sym)]
+
+# 4) define your gene sets (upper-case to match)
+gene_groups <- list(
+  `CD43 GLYCOSYLATION`     = "GCNT1",
+  CYTOKINE                 = c("IFNG","FGL2","CSF"),
+  CYTOTOXICITY             = c("GZMA","GZMB","GZMK"),
+  `TRANSCRIPTION FACTORS`  = c("ID2","JUN","ZEB2","ZBTB32","BHLHE40","FOS","FOSB","MAF"),
+  `CHEMOKINE/ADHESION`     = c("SELL","CX3CR1","CCR2","CCR10","ITGAM","ITGA1","ITGAX"),
+  `SURFACE RECEPTORS`      = c("HAVCR2","KLRA13-PS","KLRA6","KLRA7","KLRG1",
+                               "KLRA1","NRP1","PTPRJ","IFITM1","IFITM2","IFITM3")
+)
+
+# flatten to gene → group
+gene_to_group <- unlist(lapply(names(gene_groups), function(grp){
+  setNames(rep(grp, length(gene_groups[[grp]])), gene_groups[[grp]])
+}))
+
+# 5) keep only those genes in both expr and your list
+keep_genes <- intersect(rownames(expr_sym), names(gene_to_group))
+expr2      <- expr_sym[keep_genes, , drop=FALSE]
+group2     <- gene_to_group[keep_genes]
+
+# sanity check
+if(length(keep_genes)==0) stop("No matching genes found. Check SYMBOL mapping & gene_groups!")
+
+# 6) z-score each row
+zmat <- t(scale(t(expr2)))
+
+# 7) build top annotation (no trailing commas!)
+ha_col <- HeatmapAnnotation(
+  Condition = col_conds,
+  col = list(
+    Condition = c(
+      "naïve"        = "#4F81BD",
+      "CD62L+"       = "#C0504D",
+      "CD62L-CD43-"  = "#9BBB59",
+      "CD43+"        = "#8064A2"
+    )
+  ),
+  annotation_legend_param = list(Condition = list(title="Condition"))
+)
+
+# 8) draw heatmap
+Heatmap(
+  zmat,
+  name = "Row z-score",
+  top_annotation = ha_col,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  row_split = group2,
+  row_title_side = "left",
+  show_row_dend = FALSE,
+  show_column_dend = FALSE,
+  show_column_names = TRUE,
+  col = colorRamp2(c(-2, 0, 2), c("navy","white","firebrick")),
+  heatmap_legend_param = list(at = c(-2,0,2), labels = c("-2","0","2"))
+)
+```
+####################################
+### 5. Results Export
+####################################
+```{r save_results}
+# Export processed DE gene tables
+walk(all_results, function(res) {
+  tryCatch({
+    comp_name <- res$comparison
+    
+    # Regenerate formatted table with proper syntax
+    top_genes <- res$de_genes %>%
+      tibble::rownames_to_column("ENSEMBL") %>%
+      arrange(desc(prob), desc(abs(M))) %>%  
+      head(80) %>%
+      mutate(
+        Gene = ensembl_to_symbol(ENSEMBL),
+        Gene = ifelse(is.na(Gene), ENSEMBL, Gene),
+        Gene_upper = toupper(Gene),
+        across(c(M, D, prob), ~round(., 3))
+      ) %>%  # Added closing parenthesis for mutate
+      left_join(receptor_data, by = c("Gene_upper" = "Gene")) %>%
+      dplyr::select(-Gene_upper) %>%
+      dplyr::rename(
+        `Log2_FC` = M,
+        `Delta_Expression` = D,
+        `DE_Probability` = prob
+      ) %>%
+      dplyr::select(Gene, DE_Probability, Log2_FC, Type, everything(), -ENSEMBL, -ranking)
+    
+    # Save files
+    write.csv(top_genes, 
+              paste0("formatted_de_table_", sanitize_name(comp_name), ".csv"),
+              row.names = FALSE)
+    
+    write.csv(res$de_genes,
+              paste0("raw_de_results_", sanitize_name(comp_name), ".csv"))
+    
+    writeLines(head(rownames(res$de_genes), 15),
+               paste0("validation_candidates_", sanitize_name(comp_name), ".txt"))
+    
+  }, error = function(e) {
+    message("Export failed for ", comp_name, ": ", e$message)
+  })
+})
+
+
+```
+
+```{r ggplot_heatmap_fixed, message=FALSE, warning=FALSE}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(forcats)
+library(circlize)
+library(tibble)
+
+# 1) Prepare the data exactly as before
+df <- as.data.frame(zmat) %>%
+  rownames_to_column("Gene") %>%
+  pivot_longer(-Gene, names_to="Condition", values_to="Z") %>%
+  mutate(Group = gene_to_group[Gene]) %>%
+  filter(!is.na(Group)) %>%
+  group_by(Group) %>%
+  mutate(Gene = factor(Gene, levels = unique(Gene))) %>%
+  ungroup() %>%
+  mutate(
+    Group = factor(Group,
+      levels = c(
+        "CD43 GLYCOSYLATION","CYTOKINE","CHEMOKINE/ADHESION","CYTOTOXICITY",
+        "TRANSCRIPTION FACTORS","SURFACE RECEPTORS"
+      )
+    ),
+    Condition = factor(Condition,
+      levels = c("Naïve","CD62L-CD43-","CD62L+","CD43+")
+    )
+  )
+```
+
+```{r gene groups}
+gene_groups <- list(
+  `CD43\nGlycosylation`   = c("GCNT1"),
+  
+   `Chemokine/\nAdhesion`  = c("SELL","CX3CR1","CCR2","CCR10",
+                             "ITGAM","ITGA1","ITGAX","CXCR3"),
+  
+  Cytokines               = c("IFNG", "TNFA", "FGL2", "CSF"),
+  
+  `Transcription\nFactors` = c("TBX21", "TCF7", "ID2", "JUN", "ZEB2", "ZBTB32", "BHLHE40",
+                              "FOS", "FOSB", "MAF", "PRDM1", "TOX", "IRF4", "ID3", 
+                              "EOMES", "BCL6", "FOXO1"),
+  
+  `Cytotoxicity`            = c("GZMA","GZMB","GZMK"),
+  
+  `Chemokine/\nAdhesion`  = c("SELL","CX3CR1","CCR2","CCR10",
+                             "ITGAM","ITGA1","ITGAX","CXCR3"),
+  
+  `Surface\nReceptors`     = c("HAVCR2","ICOS","IL7RA","SLAMF6","KLRA13-PS",
+                             "KLRA6","KLRA7","KLRG1","KLRA1",
+                             "NRP1","PTPRJ","IFITM1","IFITM2","IFITM3", "IL7R", "IL7RB")
+)
+
+
+gene_to_group <- unlist(lapply(names(gene_groups), function(grp){
+  setNames(rep(grp, length(gene_groups[[grp]])), gene_groups[[grp]])
+}))
+
+library(AnnotationDbi); library(org.Mm.eg.db)
+
+symb <- mapIds(org.Mm.eg.db,
+               keys    = rownames(log_cpm),
+               column  = "SYMBOL",
+               keytype = "ENSEMBL",
+               multiVals = "first")
+
+expr <- log_cpm[!is.na(symb), ]
+rownames(expr) <- toupper(symb[!is.na(symb)])
+
+# Then rebuild expr2 / group2 as before:
+keep  <- intersect(rownames(expr), names(gene_to_group))
+expr2 <- expr[keep, , drop=FALSE]
+group2 <- gene_to_group[keep]
+
+# And regenerate zmat and the ComplexHeatmap:
+zmat <- t(scale(t(expr2)))
+colnames(zmat) <- c("Naïve","CD62L+","CD62L-\nCD43-\n","CD43+")
+
+```
+
+```{r finishing-touches2}
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+grid.newpage()
+# Gene group definitions (assuming group2 and zmat exist)
+
+
+# Build Heatmap with column title
+ht <- Heatmap(
+  zmat,
+  name                 = "Row z-score",
+  col                  = colorRamp2(c(-2, 0, 2), c("navy", "white", "firebrick")),
+  rect_gp              = gpar(col = "white", lwd = 0.5),
+  cluster_rows         = FALSE,
+  cluster_columns      = FALSE,
+  
+  row_split            = group2,
+  row_gap              = unit(7, "mm"),
+  
+  column_title         = "RNA-seq",  # Column title above column names
+  column_title_side    = "top",
+  column_title_gp      = gpar(fontsize = 8, fontface = "bold", fontfamily = "Helvetica"),
+  
+  row_title_side       = "left",
+  row_title_gp         = gpar(fontsize = 8, fontface = "plain", 
+                             fontfamily = "Helvetica", lineheight = 0.8),
+ 
+  width = unit(10 * ncol(zmat), "mm"),  # Total heatmap width
+  #column_width = unit(4, "mm"),        # Individual column width
+  
+  column_names_gp = gpar(fontsize = 8),  # Smaller font for narrow columns
+  column_names_side    = "top",
+  column_names_rot     = 0,
+  column_names_centered= TRUE,
+  
+  heatmap_legend_param = list(legend_direction = "horizontal", title_position = "topcenter")
+)
+
+# Draw main title
+grid.newpage()
+pushViewport(viewport(y = unit(1, "npc") - unit(3, "lines"),  # Adjusted spacing
+                      height = unit(8, "lines"), 
+                      just = "top"))
+grid.rect(gp = gpar(fill = "white", col = "black", lty = 2))
+grid.text("RNA-seq Analysis", 
+          gp = gpar(fontsize = 12, fontface = "bold", col = "darkblue"))
+popViewport()
+
+# Draw heatmap with both titles
+fprint <- draw(ht, 
+     heatmap_legend_side = "bottom", 
+     padding = unit(c(5, 2, 2, 2), "mm"))  # Top padding for title space
+
+print(fprint)
+```
+```{r adjustment_testing}
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+# Build Heatmap with column title
+ht <- Heatmap(
+  zmat,
+  name                 = "Row z-score",
+  col                  = colorRamp2(c(-2, 0, 2), c("navy", "white", "firebrick")),
+  rect_gp              = gpar(col = "white", lwd = 0.5),
+  cluster_rows         = FALSE,
+  cluster_columns      = FALSE,
+  
+  row_split            = group2,
+  row_gap              = unit(5, "mm"),
+  
+  column_title         = "RNA-seq\n",  # Column title above column names
+  column_title_side    = "top",
+  column_title_gp      = gpar(fontsize = 12, fontface = "bold", fontfamily = "Helvetica"),
+  
+  
+  row_title_side       = "left",
+  row_title_gp         = gpar(fontsize = 12, fontface = "plain", 
+                             fontfamily = "Helvetica", lineheight = 0.8),
+ 
+  width = unit(15 * ncol(zmat), "mm"),  # Total heatmap width
+  height = unit(nrow(zmat) * 5, "mm"),
+  
+  column_names_gp = gpar(fontsize = 12),  # Smaller font for narrow columns
+  column_names_side    = "top",
+  column_names_rot     = 0,
+  column_names_centered= TRUE,
+  
+  heatmap_legend_param = list(legend_direction = "horizontal", title_position = "topcenter")
+)
+
+# Draw main title
+
+# pushViewport(viewport(y = unit(1, "npc") - unit(3, "lines"),  # Adjusted spacing
+#                       height = unit(8, "lines"), 
+#                       just = "top"))
+# grid.rect(gp = gpar(fill = "white", col = "black", lty = 2))
+# grid.text("RNA-seq Analysis", 
+#           gp = gpar(fontsize = 12, fontface = "bold", col = "darkblue"))
+# popViewport()
+# 
+# # Draw heatmap with both titles
+# HMprint <- draw(ht, 
+#      heatmap_legend_side = "bottom", 
+#      padding = unit(c(5, 2, 2, 2), "mm"))  # Top, right, bottom, left
+# 
+# print(HMprint)
+# png("HMprint.png")
+# pdf("HMprint.pdf")
+
+# Large PNG output
+
+png("HMprint_large.png", width = 2250, height = 4250, res = 400)
+grid.newpage()
+pushViewport(viewport(y = unit(1, "npc") - unit(3, "lines"), height = unit(8, "lines"), just = "top"))
+grid.rect(gp = gpar(fill = "white", col = "black", lty = 2))
+grid.text("RNA-seq Analysis", gp = gpar(fontsize = 12, fontface = "bold", col = "darkblue"))
+popViewport()
+HMprint <- draw(ht, heatmap_legend_side = "bottom", padding = unit(c(5, 2, 2, 2), "mm"))
+dev.off()
+
+# PDF output
+pdf("HMprint.pdf", width = 8, height = 10)
+grid.newpage()
+pushViewport(viewport(y = unit(1, "npc") - unit(3, "lines"), height = unit(8, "lines"), just = "top"))
+grid.rect(gp = gpar(fill = "white", col = "black", lty = 2))
+grid.text("RNA-seq Analysis", gp = gpar(fontsize = 12, fontface = "bold", col = "darkblue"))
+popViewport()
+draw(ht, heatmap_legend_side = "bottom", padding = unit(c(5, 2, 2, 2), "mm"))
+dev.off()
+
+```
+
+
+
+
+```{r heatmap_spacing}
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+# Build Heatmap with column title
+ht <- Heatmap(
+  zmat,
+  name                 = "Row z-score",
+  col                  = colorRamp2(c(-2, 0, 2), c("navy", "white", "firebrick")),
+  rect_gp              = gpar(col = "white", lwd = 0.5),
+  cluster_rows         = FALSE,
+  cluster_columns      = FALSE,
+  
+  row_split            = group2,
+  row_gap              = unit(12, "mm"),
+  
+  column_title         = "RNA-seq\n",  # Column title above column names
+  column_title_side    = "top",
+  column_title_gp      = gpar(fontsize = 12, fontface = "bold", fontfamily = "Helvetica"),
+  
+  
+  row_title_side       = "left",
+  row_title_gp         = gpar(fontsize = 12, fontface = "plain", 
+                             fontfamily = "Helvetica", lineheight = 0.8),
+ 
+  width = unit(15 * ncol(zmat), "mm"),  # Total heatmap width
+  height = unit(nrow(zmat) * 5, "mm"),
+  
+  column_names_gp = gpar(fontsize = 12),  # Smaller font for narrow columns
+  column_names_side    = "top",
+  column_names_rot     = 0,
+  column_names_centered= TRUE,
+  
+  heatmap_legend_param = list(legend_direction = "horizontal", title_position = "topcenter")
+)
+
+# # Draw main title
+# grid.newpage()
+# pushViewport(viewport(y = unit(1, "npc") - unit(3, "lines"),  # Adjusted spacing
+#                       height = unit(8, "lines"),
+#                       just = "top"))
+# grid.rect(gp = gpar(fill = "white", col = "black", lty = 2))
+# grid.text("RNA-seq Analysis",
+#           gp = gpar(fontsize = 12, fontface = "bold", col = "darkblue"))
+# popViewport()
+# 
+# # Draw heatmap with both titles
+# grid.newpage()
+# HMprint2 <- draw(ht,
+#      heatmap_legend_side = "bottom",
+#      padding = unit(c(5, 2, 2, 2), "mm"))  # Top, right, bottom, left
+# 
+# print(HMprint2)
+# png("HMprint2.png")
+# pdf("HMprint2")
+
+
+
+# Large PNG output
+
+png("HMprint2_large.png", width = 2250, height = 4250, res = 400)
+grid.newpage()
+pushViewport(viewport(y = unit(1, "npc") - unit(3, "lines"), height = unit(8, "lines"), just = "top"))
+grid.rect(gp = gpar(fill = "white", col = "black", lty = 2))
+grid.text("RNA-seq Analysis", gp = gpar(fontsize = 12, fontface = "bold", col = "darkblue"))
+popViewport()
+HMprint2 <- draw(ht, heatmap_legend_side = "bottom", padding = unit(c(5, 2, 2, 2), "mm"))
+dev.off()
+
+
+# PDF output
+pdf("HMprint2.pdf", width = 7, height = 9)
+grid.newpage()
+pushViewport(viewport(y = unit(1, "npc") - unit(3, "lines"), height = unit(8, "lines"), just = "top"))
+grid.rect(gp = gpar(fill = "white", col = "black", lty = 2))
+grid.text("RNA-seq Analysis", gp = gpar(fontsize = 12, fontface = "bold", col = "darkblue"))
+popViewport()
+draw(ht, heatmap_legend_side = "bottom", padding = unit(c(5, 2, 2, 2), "mm"))
+dev.off()
+```
+
+####################################
+####################################
+####################################
+
+####################################
+### 6. Enhanced Heatmaps for CD43+ Comparisons
+####################################
+```{r enhanced_heatmaps}
+
+# Compute normalized counts
+dge <- DGEList(filtered_counts)
+dge <- calcNormFactors(dge)
+normalized_counts <- cpm(dge, log = TRUE, prior.count = 1)
+
+# Modified Heatmap Function for Pairwise Comparisons
+de_heatmap_pairwise <- function(de_genes, comp_name, conditions) {
+  # Find which original samples have those recoded labels:
+  samples_to_keep <- rownames(sample_metadata)[
+    sample_metadata$Condition %in% conditions
+  ]
+  # Subset by original columns:
+  dge_object <- DGEList(counts = filtered_counts[rownames(de_genes), samples_to_keep])
+  dge_object <- calcNormFactors(dge_object)
+  normalized_counts <- cpm(dge_object, log = TRUE, prior.count = 1)
+
+  # Pick top 50 genes
+  top_genes <- de_genes[order(de_genes$prob, decreasing = TRUE), ] %>% head(50)
+  heatmap_data <- normalized_counts[rownames(top_genes), ]
+
+  pheatmap(
+    heatmap_data,
+    annotation_col = sample_metadata[samples_to_keep, , drop = FALSE],
+    show_rownames = FALSE,
+    cluster_cols = FALSE,
+    color = colorRampPalette(c("red", "blue"))(50),
+    main = paste("Top 50 DE Genes:", comp_name)
+  )
+}
+
+# Generate pairwise heatmaps
+walk(all_results, ~{
+  comp_conditions <- unlist(strsplit(.x$comparison, "_vs_"))
+  de_heatmap_pairwise(.x$de_genes, .x$comparison, comp_conditions)
+})
+
+library(pheatmap)
+
+create_custom_heatmap <- function(de_genes_df, comp_name) {
+  # 'de_genes_df' is the data frame from your DE results (like res$de_genes)
+  # Subset the top 50 by probability (or whatever metric)
+  top_genes <- de_genes_df[order(de_genes_df$prob, decreasing = TRUE), ]
+  top_genes <- rownames(top_genes)[1:min(15, nrow(top_genes))]
+
+  # 'normalized_counts' is your log-CPM matrix from edgeR
+  heatmap_data <- normalized_counts[top_genes, , drop = FALSE]
+
+  # Optional: row annotation (if you have gene labels or categories)
+  annotation_row <- data.frame(
+    Label = top_genes,  # or something more meaningful
+    row.names = top_genes
+  )
+
+  pheatmap(
+    heatmap_data,
+    main = "Scores",                               # Title
+    show_rownames = TRUE,                          # Display row names
+    show_colnames = TRUE,                          # Display column names
+    cluster_rows = TRUE,                           # Cluster rows
+    cluster_cols = TRUE,                           # Cluster columns
+    annotation_col = sample_metadata,              # Column annotation
+    annotation_row = annotation_row,               # Row annotation
+    color = colorRampPalette(c("purple", "yellow"))(50), 
+    annotation_names_row = TRUE,                   
+    annotation_names_col = TRUE,
+    border_color = NA  # optional, remove cell borders
+  )
+}
+
+walk(all_results, ~{
+  create_custom_heatmap(.x$de_genes, .x$comparison)
+})
+
+```
+####################################
+### 6.5. Score Heatmap Generation (No-Replicate Data)
+####################################
+```{r score_heatmap_generation}
+# For no-replicate data, we avoid using dat() and plotScoreHeatmap
+# Instead, we use the normalized counts computed from edgeR
+
+# Ensure normalized_counts is computed once (from your QC section)
+dge <- DGEList(filtered_counts)
+dge <- calcNormFactors(dge)
+normalized_counts <- cpm(dge, log = TRUE, prior.count = 1)
+
+# Modified heatmap function for no-replicate data
+create_score_heatmap_noRep <- function(res) {
+  comp_name <- res$comparison
+  
+  # Get DE genes and subset normalized_counts accordingly
+  de_genes <- rownames(res$de_genes)
+  
+  # Select top 50 DE genes (or fewer if not available)
+  top_genes <- res$de_genes[order(res$de_genes$prob, decreasing = TRUE), ]
+  top_genes <- rownames(top_genes)[1:min(50, nrow(top_genes))]
+  
+  # Subset the normalized counts matrix to these top genes
+  heatmap_data <- normalized_counts[top_genes, ]
+  
+  # Generate the heatmap using pheatmap
+  pheatmap(
+    heatmap_data,
+    annotation_col = sample_metadata,
+    show_rownames = FALSE,
+    color = colorRampPalette(c("purple", "#ffd700"))(50),
+    main = paste("Top 50 DE Genes:", comp_name)
+  )
+}
+
+# Generate heatmaps for each comparison using the modified function
+walk(all_results, create_score_heatmap_noRep)
+
+```
+####################################
+### 7. GSEA Analysis
+####################################
+```{r gsea_analysis}
+if (!require("clusterProfiler")) BiocManager::install("clusterProfiler")
+library(clusterProfiler)
+
+# Run GSEA for each comparison
+walk(all_results, function(res) {
+  tryCatch({
+    # Create ranked gene list
+    gene_list <- res$de_genes %>%
+      mutate(rank_score = sign(M) * prob) %>%
+      arrange(desc(rank_score)) %>%
+      tibble::rownames_to_column("ENSEMBL") %>%
+      mutate(ENTREZID = mapIds(org.Mm.eg.db,
+                               keys = ENSEMBL,
+                               column = "ENTREZID",
+                               keytype = "ENSEMBL",
+                               multiVals = "first")) %>%  # Resolves 1:many mapping
+      filter(!is.na(ENTREZID)) %>%
+      distinct(ENTREZID, .keep_all = TRUE)
+    
+    ranked_list <- gene_list$rank_score
+    names(ranked_list) <- gene_list$ENTREZID
+    
+    # Run GSEA with eps set to 0 for more precise p-value estimation
+    gsea_results <- gseGO(
+      geneList = ranked_list,
+      OrgDb = org.Mm.eg.db,
+      ont = "BP",
+      minGSSize = 25,
+      maxGSSize = 500,
+      pvalueCutoff = 0.05,
+      eps = 0
+    )
+    
+    # Visualization
+    if(nrow(gsea_results) > 0) {
+      print(dotplot(gsea_results, showCategory=15, 
+                    title=paste("GSEA -", res$comparison)))
+      ridgeplot(gsea_results) + ggtitle(paste("Ridge Plot -", res$comparison))
+    }
+  }, error = function(e) message("GSEA failed for ", res$comparison))
+})
+
+
+```
+####################################
+### 8. Session Information
+####################################
+```{r session_info}
+
+print(sessionInfo())
+```
+
+
